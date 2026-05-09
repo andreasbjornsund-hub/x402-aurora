@@ -1,28 +1,44 @@
 """
-x402 Agent — REPLACE THIS DESCRIPTION
+Aurora — Norwegian Weather Intelligence
+
+x402 micropayment API wrapping MET Norway's free weather services into an
+agent-friendly shape. Pay per query with USDC on Base.
 
 Endpoints (free):
-  GET /                   — landing page (HTML or JSON)
-  GET /health             — health check
-  GET /api-status         — uptime + cache shape (operational visibility)
-  GET /services.json      — agent-readable services manifest
-  GET /llms.txt           — LLMs.txt for AI crawlers
-  GET /robots.txt         — robots policy
-  GET /.well-known/x402.json — x402 agent-discovery manifest
+  GET /                       — landing page (HTML or JSON)
+  GET /health                 — health check
+  GET /api-status             — uptime + cache shape
+  GET /cities                 — list of supported Norwegian city names
+  GET /services.json          — agent-readable services manifest
+  GET /llms.txt               — LLMs.txt for AI crawlers
+  GET /robots.txt             — robots policy
+  GET /.well-known/x402.json  — x402 agent-discovery manifest
 
-Endpoints (paid — REPLACE):
-  GET /example             — $0.01: replace with your paid endpoint
+Endpoints (paid, USDC on Base):
+  GET /forecast               — $0.005: 48h forecast for lat/lon (+ sunrise)
+  GET /forecast/city          — $0.005: same, by Norwegian city name
+  GET /marine                 — $0.01:  marine/ocean forecast for lat/lon
+  GET /alerts                 — $0.005: active MET weather alerts (optional county filter)
+
+Data: MET Norway (free, no API key required). Per their ToS we identify
+ourselves with a User-Agent and stay under their soft 20 req/sec limit.
 """
 
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+
+import cities
+import met_client
+from met_client import MetError
+import parsers
 
 from cdp_auth import create_cdp_auth_provider
 
@@ -37,23 +53,27 @@ load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────
 
-# Override these for each agent. Defaults match the shared payTo wallet.
-SERVICE_ID = os.getenv("SERVICE_ID", "x402-agent-template")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "x402 Agent Template")
-SERVICE_DESCRIPTION = os.getenv(
-    "SERVICE_DESCRIPTION",
-    "REPLACE: short description of what this agent does. Pay per query with USDC via x402.",
+SERVICE_ID = "aurora"
+SERVICE_NAME = "Aurora — Norwegian Weather Intelligence"
+SERVICE_DESCRIPTION = (
+    "Weather forecasts, marine data, and alerts for Norway and Scandinavian waters. "
+    "Powered by MET Norway. Pay per query with USDC via x402."
 )
-SERVICE_CATEGORY = os.getenv("SERVICE_CATEGORY", "data")
+SERVICE_CATEGORY = "weather"
 
 EVM_ADDRESS = os.getenv("EVM_ADDRESS")
 EVM_NETWORK: Network = "eip155:8453"  # Base mainnet
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "https://x402.org/facilitator")
-SITE_URL = os.getenv("SITE_URL", f"https://{SERVICE_ID}.fly.dev")
+SITE_URL = os.getenv("SITE_URL", "https://x402-aurora.fly.dev")
 
-# USDC contract on Base mainnet — embedded in agent-discovery manifests so
-# payers can sign EIP-3009 transferWithAuthorization without an extra lookup.
 USDC_BASE_MAINNET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# Cache TTLs (seconds). MET updates locationforecast hourly; marine & alerts
+# evolve more slowly. Sunrise is deterministic per day.
+TTL_FORECAST = int(os.getenv("TTL_FORECAST", str(30 * 60)))   # 30 min
+TTL_MARINE = int(os.getenv("TTL_MARINE", str(60 * 60)))       # 1 hour
+TTL_ALERTS = int(os.getenv("TTL_ALERTS", str(5 * 60)))        # 5 min
+TTL_SUNRISE = int(os.getenv("TTL_SUNRISE", str(12 * 60 * 60)))  # 12 h
 
 if not EVM_ADDRESS:
     raise ValueError("Set EVM_ADDRESS in .env")
@@ -86,10 +106,6 @@ if "cdp.coinbase.com" in FACILITATOR_URL:
     cdp_auth = create_cdp_auth_provider()
 facilitator_config = FacilitatorConfig(url=FACILITATOR_URL, auth_provider=cdp_auth)
 facilitator = HTTPFacilitatorClient(facilitator_config)
-
-# ── V2→V1 conversion shim for CDP facilitator ──────────────────────
-# CDP only supports x402 v1; the SDK speaks v2. This shim translates
-# in both directions. Keep verbatim — modifying it breaks payments.
 
 _CAIP2_TO_V1 = {"eip155:8453": "base", "eip155:84532": "base-sepolia"}
 
@@ -153,25 +169,85 @@ server = x402ResourceServer(facilitator)
 server.register(EVM_NETWORK, ExactEvmServerScheme())
 
 # ── Endpoint catalog ────────────────────────────────────────────────
-# Single source of truth. Drives x402 middleware routes, /services.json,
-# /llms.txt, /.well-known/x402.json, and the root JSON response. Add a
-# new entry here + one handler below = new endpoint everywhere.
-
 
 ENDPOINT_CATALOG: list[dict] = [
-    # ── REPLACE: paid endpoints ──
     {
         "method": "GET",
-        "path": "/example",
-        "route_pattern": "GET /example",
-        "description": "REPLACE: short description of this paid endpoint.",
-        "price_usd": "$0.01",
-        "amount_atomic": "10000",  # USDC has 6 decimals; $0.01 = 10000 microUSDC
-        "query_params": {"q": "example"},
+        "path": "/forecast",
+        "route_pattern": "GET /forecast",
+        "description": "48-hour weather forecast for any Norwegian/Scandinavian coordinates. Includes current conditions, hourly series, daily highs/lows, and sunrise/sunset.",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"lat": 59.9139, "lon": 10.7522},
         "path_params": {},
-        "output_example": {"result": "replace me"},
+        "output_example": {
+            "location": {"lat": 59.91, "lon": 10.75},
+            "current": {"temp": 12.3, "wind_speed": 5.2, "wind_dir": "SW", "symbol": "cloudy"},
+            "hourly": [{"time": "2026-05-09T08:00Z", "temp": 12.3, "precip_mm": 0.0, "symbol": "cloudy"}],
+            "daily_summary": [{"date": "2026-05-09", "high": 15.2, "low": 8.1, "precip_total": 2.3, "dominant_symbol": "lightrain"}],
+            "sun": {"sunrise": "2026-05-09T04:32:00+02:00", "sunset": "2026-05-09T21:38:00+02:00"},
+        },
     },
-    # ── Free endpoints (don't remove /health) ──
+    {
+        "method": "GET",
+        "path": "/forecast/city",
+        "route_pattern": "GET /forecast/city",
+        "description": "Same as /forecast but takes a Norwegian city name. ~50 cities pre-loaded with fuzzy matching.",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"name": "oslo"},
+        "path_params": {},
+        "output_example": {
+            "city": "oslo",
+            "location": {"lat": 59.9139, "lon": 10.7522},
+            "current": {"temp": 12.3, "wind_speed": 5.2, "wind_dir": "SW", "symbol": "cloudy"},
+            "hourly": [],
+            "daily_summary": [],
+            "sun": {"sunrise": "2026-05-09T04:32:00+02:00", "sunset": "2026-05-09T21:38:00+02:00"},
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/marine",
+        "route_pattern": "GET /marine",
+        "description": "Marine/ocean forecast for any coordinates in Norwegian/Scandinavian waters: wave height, period, direction, water temperature, currents.",
+        "price_usd": "$0.01",
+        "amount_atomic": "10000",
+        "query_params": {"lat": 60.0, "lon": 4.0},
+        "path_params": {},
+        "output_example": {
+            "location": {"lat": 60.0, "lon": 4.0},
+            "current": {"wave_height_m": 1.4, "wave_direction": "SW", "water_temp": 8.6, "current_speed_ms": 0.21},
+            "hourly": [{"time": "2026-05-09T08:00Z", "wave_height_m": 1.5}],
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/alerts",
+        "route_pattern": "GET /alerts",
+        "description": "Active MET weather alerts. Optional ?county= filter (text-match on county/area name).",
+        "price_usd": "$0.005",
+        "amount_atomic": "5000",
+        "query_params": {"county": "rogaland"},
+        "path_params": {},
+        "output_example": {
+            "active_alerts": [
+                {"event_type": "Strong wind", "severity": "Yellow", "area": "Rogaland", "headline": "Kraftige vindkast", "valid_from": "2026-05-09T09:00:00Z", "valid_to": "2026-05-09T18:00:00Z"}
+            ],
+            "count": 1,
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/cities",
+        "route_pattern": None,
+        "description": "List of supported Norwegian cities (free).",
+        "price_usd": None,
+        "amount_atomic": None,
+        "query_params": {},
+        "path_params": {},
+        "output_example": {"count": 50, "cities": [{"name": "oslo", "lat": 59.9139, "lon": 10.7522}]},
+    },
     {
         "method": "GET",
         "path": "/health",
@@ -187,7 +263,7 @@ ENDPOINT_CATALOG: list[dict] = [
         "method": "GET",
         "path": "/api-status",
         "route_pattern": None,
-        "description": "Operational status — uptime and cache shape.",
+        "description": "Operational status — uptime and MET cache shape.",
         "price_usd": None,
         "amount_atomic": None,
         "query_params": {},
@@ -239,7 +315,7 @@ def _build_paid_routes(catalog: list[dict]) -> dict[str, RouteConfig]:
 routes = _build_paid_routes(ENDPOINT_CATALOG)
 app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
 
-# ── HTTP client (reuse for upstream API calls) ──────────────────────
+# ── HTTP client (shared, reused across MET calls) ───────────────────
 
 _http = httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"})
 
@@ -250,7 +326,6 @@ _PROCESS_START_TS = time.time()
 
 @app.get("/")
 async def landing(request: Request):
-    """Content-negotiate: HTML for browsers, JSON for API clients."""
     accept = request.headers.get("accept", "")
     if "text/html" in accept and os.path.isfile("static/index.html"):
         return FileResponse("static/index.html")
@@ -265,6 +340,7 @@ async def landing(request: Request):
         }
         | {"/.well-known/x402.json": "Agent discovery"},
         "payment": "x402 protocol — USDC on Base network",
+        "data_source": "MET Norway (https://api.met.no)",
     }
 
 
@@ -275,18 +351,24 @@ async def health():
 
 @app.get("/api-status")
 async def api_status():
-    """Free operational status endpoint. Extend with cache stats etc."""
     return {
         "status": "ok",
         "service": SERVICE_ID,
         "version": "0.1.0",
         "uptime_seconds": int(time.time() - _PROCESS_START_TS),
+        "upstream": "met.no",
+        "cache": met_client.cache_stats(),
     }
+
+
+@app.get("/cities")
+async def list_cities():
+    cs = cities.all_cities()
+    return {"count": len(cs), "cities": cs}
 
 
 @app.get("/services.json")
 async def services_manifest():
-    """Agentic Market / Bazaar service manifest for auto-discovery."""
     return {
         "id": SERVICE_ID,
         "name": SERVICE_NAME,
@@ -310,7 +392,6 @@ async def services_manifest():
 
 @app.get("/.well-known/x402.json")
 async def x402_manifest():
-    """x402 agent-discovery manifest, generated from the endpoint catalog."""
     return {
         "x402Version": 2,
         "service": {
@@ -368,7 +449,6 @@ async def x402_manifest():
 
 @app.get("/llms.txt")
 async def llms_txt():
-    """LLMs.txt convention — agent-readable plain-text manifest."""
     lines = [
         f"# {SERVICE_NAME}",
         f"> {SERVICE_DESCRIPTION}",
@@ -385,6 +465,15 @@ async def llms_txt():
         "- Currency: USDC on Base",
         "- No API keys or accounts needed",
         "- Agent discovery: GET /.well-known/x402.json",
+        "",
+        "## Source data",
+        "- MET Norway (https://api.met.no) — free, no API key required",
+        "- We respect their soft 20 req/sec limit and identify ourselves with a User-Agent header",
+        "- Forecasts cached for 30 min, marine for 1 hr, alerts for 5 min",
+        "",
+        "## Coverage",
+        "- Coordinates: Norway, Svalbard, Jan Mayen, plus Scandinavian waters (lat 55-81, lon -10 to 35)",
+        "- Cities: ~50 Norwegian municipalities by population (see GET /cities)",
         "",
         "## Links",
         f"- Website: {SITE_URL}",
@@ -416,19 +505,128 @@ async def robots_txt():
     )
 
 
-# ── Paid endpoints (REPLACE these with your agent's logic) ──────────
+# ── Helpers ─────────────────────────────────────────────────────────
 
 
-@app.get("/example")
-async def example_endpoint(q: str = Query(..., min_length=1, max_length=200)):
-    """REPLACE: this is a paid endpoint. Add your business logic here.
+def _validate_coords(lat: float, lon: float) -> None:
+    if not parsers.in_norway(lat, lon):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Coordinates ({lat}, {lon}) are outside coverage area "
+                f"(lat {parsers.NORWAY_LAT_MIN}-{parsers.NORWAY_LAT_MAX}, "
+                f"lon {parsers.NORWAY_LON_MIN}-{parsers.NORWAY_LON_MAX})"
+            ),
+        )
 
-    The x402 middleware has already verified payment by the time this
-    handler runs. Returning a non-error response triggers settlement;
-    raising HTTPException with status >= 400 cancels settlement (the
-    customer is not charged).
-    """
-    return {"q": q, "result": "replace me with real data"}
+
+def _set_cache_header(response: Response, cache_hit: bool) -> None:
+    response.headers["X-Cache"] = "HIT" if cache_hit else "MISS"
+
+
+async def _fetch_sun(lat: float, lon: float) -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        data, _ = await met_client.fetch(
+            _http,
+            met_client.SUNRISE,
+            params={"lat": lat, "lon": lon, "date": today},
+            ttl=TTL_SUNRISE,
+        )
+        return parsers.parse_sunrise(data)
+    except MetError:
+        return {"sunrise": "", "sunset": ""}
+
+
+# ── Paid endpoints ──────────────────────────────────────────────────
+
+
+@app.get("/forecast")
+async def forecast(
+    response: Response,
+    lat: float = Query(..., description="Latitude (WGS84)"),
+    lon: float = Query(..., description="Longitude (WGS84)"),
+):
+    _validate_coords(lat, lon)
+    try:
+        data, hit = await met_client.fetch(
+            _http,
+            met_client.LOCATION_FORECAST,
+            params={"lat": lat, "lon": lon},
+            ttl=TTL_FORECAST,
+        )
+    except MetError as e:
+        raise HTTPException(status_code=503, detail=f"MET upstream unavailable: {e.message}")
+    parsed = parsers.parse_forecast(data)
+    parsed["sun"] = await _fetch_sun(lat, lon)
+    _set_cache_header(response, hit)
+    return parsed
+
+
+@app.get("/forecast/city")
+async def forecast_by_city(
+    response: Response,
+    name: str = Query(..., min_length=1, max_length=64, description="Norwegian city name"),
+):
+    resolved = cities.lookup(name)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"City '{name}' not found. See GET /cities for available names.",
+        )
+    canonical, lat, lon = resolved
+    try:
+        data, hit = await met_client.fetch(
+            _http,
+            met_client.LOCATION_FORECAST,
+            params={"lat": lat, "lon": lon},
+            ttl=TTL_FORECAST,
+        )
+    except MetError as e:
+        raise HTTPException(status_code=503, detail=f"MET upstream unavailable: {e.message}")
+    parsed = parsers.parse_forecast(data)
+    parsed["city"] = canonical
+    parsed["sun"] = await _fetch_sun(lat, lon)
+    _set_cache_header(response, hit)
+    return parsed
+
+
+@app.get("/marine")
+async def marine(
+    response: Response,
+    lat: float = Query(..., description="Latitude (WGS84)"),
+    lon: float = Query(..., description="Longitude (WGS84)"),
+):
+    _validate_coords(lat, lon)
+    try:
+        data, hit = await met_client.fetch(
+            _http,
+            met_client.OCEANFORECAST,
+            params={"lat": lat, "lon": lon},
+            ttl=TTL_MARINE,
+        )
+    except MetError as e:
+        if e.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="No marine data for these coordinates (likely inland).",
+            )
+        raise HTTPException(status_code=503, detail=f"MET upstream unavailable: {e.message}")
+    _set_cache_header(response, hit)
+    return parsers.parse_marine(data)
+
+
+@app.get("/alerts")
+async def alerts(
+    response: Response,
+    county: str | None = Query(None, max_length=64, description="Norwegian county name (optional filter)"),
+):
+    try:
+        data, hit = await met_client.fetch(_http, met_client.METALERTS, ttl=TTL_ALERTS)
+    except MetError as e:
+        raise HTTPException(status_code=503, detail=f"MET upstream unavailable: {e.message}")
+    _set_cache_header(response, hit)
+    return parsers.parse_alerts(data, county=county)
 
 
 # ── Static files ────────────────────────────────────────────────────

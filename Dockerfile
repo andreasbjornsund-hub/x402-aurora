@@ -7,9 +7,8 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml .
 RUN uv pip install --system "fastapi>=0.115" "uvicorn>=0.34" "x402[fastapi,evm]>=2.9" "python-dotenv>=1.0" "httpx>=0.27" "PyJWT[crypto]>=2.8"
 
-COPY main.py cdp_auth.py ./
-# Optional static dir — copy if present (won't fail if absent thanks to glob).
-COPY stati[c] static
+COPY main.py cdp_auth.py cities.py met_client.py parsers.py ./
+COPY static static
 
 ENV FACILITATOR_URL=https://x402.org/facilitator
 # NOTE: EVM_ADDRESS and any agent-specific secrets should be set via
